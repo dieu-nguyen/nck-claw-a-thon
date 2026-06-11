@@ -117,6 +117,22 @@ decide *when* to call it and *how* to render the result.
 - Superset credentials stored as AgentBase secrets/identity.
 - **Stateless** — no memory store required in v1 (baselines come from charts).
 
+### Integrations & dependencies
+- **Superset access — direct REST API (v1).** The agent calls Superset's
+  chart-data endpoints directly over HTTP using stored credentials. No MCP
+  server or gateway is required at run-time. The Superset client is implemented
+  behind a small internal interface (`get_chart_data`, `list_charts`) so the
+  data source could later be swapped for an MCP-backed implementation without
+  touching the engine or deep-dive loop.
+- **No MCP at run-time.** MCP/Resource Gateway is intentionally deferred; it
+  would only be worthwhile to centralize auth/policy/audit across multiple agents.
+- **No "skills" at run-time.** Cursor/AgentBase *skills* are build-time authoring
+  aids (scaffolding, Superset/DataHub discovery, deployment); they are not a
+  component of the running agent.
+- **LLM** via AgentBase platform LLM (managed key).
+- **Teams** is fully decoupled: the agent only returns JSON; Teams Workflows
+  handle scheduling, the run trigger, and rendering.
+
 ## 5. Monitoring Playbook (config schema)
 
 A YAML file listing checks plus a global `deep_dive` default. Each check = one
