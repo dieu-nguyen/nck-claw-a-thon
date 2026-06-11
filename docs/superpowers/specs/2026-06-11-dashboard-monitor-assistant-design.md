@@ -30,6 +30,9 @@ Scan dashboards → detect abnormal (threshold breach OR deviation vs past)
 - Reading metric values from specified Superset charts.
 - Threshold rules and deviation-vs-past rules per metric.
 - Ordered, multi-chart drill-down on anomalies.
+- **Bounded LLM deep-dive** (hybrid): when the fixed drill-down isn't enough to
+  explain an anomaly, the LLM may investigate additional charts within a
+  whitelisted, read-only scope and budget.
 - Plain-language reasoning over the drill-down trail (LLM).
 - Reporting to a Teams channel/chat as an Adaptive Card.
 
@@ -37,21 +40,37 @@ Scan dashboards → detect abnormal (threshold breach OR deviation vs past)
 - **Email summarizing** (Phase 2 — needs Microsoft Graph/Outlook access).
 - Free-form conversational Q&A in Teams.
 - Taking actions / writing back to any system (read-only by design).
-- Multi-step adaptive exploration beyond the configured drill-down list.
+- Unbounded autonomous exploration (the deep-dive is constrained by scope + budget).
 
 ## 3. Approach
 
-**Approach A — Declarative Monitoring Playbook.**
+**Approach A (hybrid) — Declarative Monitoring Playbook with bounded LLM deep-dive.**
 
-Checks are declared once in a config file. The agent executes the playbook
-deterministically each run. This was chosen over an autonomous exploratory
-agent (less predictable, harder to audit, costlier) and over direct SQL on
-warehouse tables (bypasses the curated charts already trusted, duplicates
-business logic).
+Checks are declared once in a config file and the agent executes the playbook
+**deterministically** each run. This deterministic backbone was chosen over a
+fully autonomous exploratory agent (less predictable, harder to audit, costlier)
+and over direct SQL on warehouse tables (bypasses the curated charts already
+trusted, duplicates business logic).
+
+On top of that backbone, a **bounded agentic escalation** is layered in: when the
+fixed drill-down does not give the LLM enough to confidently explain an anomaly,
+the LLM may autonomously investigate additional charts — but only within a
+whitelisted, read-only scope and a strict budget (see §6.1). This gives the
+flexibility of an agent for the hard cases while preserving determinism,
+auditability, and predictable cost for the common case.
+
+### What kind of system is this?
+This is best described as **LLM-augmented automation with a bounded agentic
+escalation**, not a fully autonomous agent. The LLM does not drive normal
+control flow — the playbook + rule engine decide what to check, what is
+abnormal, and the default drill-down. The LLM's role is (a) synthesizing the
+plain-language reason, and (b) *only when it is low-confidence*, taking
+constrained read-only investigative actions to find the root cause.
 
 Rationale: matches the known/fixed drill-down paths, is auditable (every
-conclusion traces to a chart + rule — important in fintech), has predictable
-cost, and is easy to extend by editing config.
+conclusion traces to charts + rules — important in fintech), has predictable
+cost in the common case, and is easy to extend by editing config — while still
+handling complex anomalies that the fixed map can't fully explain.
 
 ## 4. Architecture
 
@@ -65,9 +84,10 @@ decide *when* to call it and *how* to render the result.
    (Teams Workflow  │            Monitoring Engine                 │
     recurrence)     │                                              │──▶ Superset (read chart data)
                     │  1. load + validate playbook                 │
-   Teams "run now"──▶│  2. for each check: fetch chart → eval rule  │──▶ LLM      (write reason/digest)
-   (Teams Workflow) │  3. if abnormal: fetch drill-down charts     │
-                    │  4. LLM writes plain-language reason          │
+   Teams "run now"──▶│  2. for each check: fetch chart → eval rule  │──▶ LLM      (reason + deep-dive)
+   (Teams Workflow) │  3. if abnormal: fetch fixed drill-down       │
+                    │  4. LLM reasons; if low-confidence → bounded  │
+                    │     deep-dive (read-only, scoped, budgeted)   │
                     │  5. assemble report (JSON)                   │
                     └──────────────────────┬───────────────────────┘
                                            │ findings JSON
@@ -82,9 +102,14 @@ decide *when* to call it and *how* to render the result.
 - **Monitoring engine** — deterministic loop: fetch → evaluate → drill down →
   collect findings. Pure and testable in isolation.
 - **Superset client** — reads chart data (via available Superset tooling).
+  Exposes read-only tools `get_chart_data(chart_id)` and
+  `list_charts(dashboard_id)` used by both the engine and the deep-dive loop.
 - **LLM reporter** — turns structured findings into plain-language reasons + digest.
+- **Deep-dive investigator** — bounded read-only loop the LLM may enter when
+  low-confidence; explores whitelisted dashboards within a fetch/step budget (§6.1).
 - **Report builder** — assembles findings into the JSON the Workflow renders.
-- **Run log** — per-run, per-check record of what was fetched and concluded (audit).
+- **Run log** — per-run, per-check record of what was fetched and concluded,
+  including every deep-dive action and reasoning step (audit).
 
 ### Hosting
 - GreenNode AgentBase runtime.
@@ -94,9 +119,19 @@ decide *when* to call it and *how* to render the result.
 
 ## 5. Monitoring Playbook (config schema)
 
-A YAML file listing checks. Each check = one metric to watch.
+A YAML file listing checks plus a global `deep_dive` default. Each check = one
+metric to watch.
 
 ```yaml
+# Global default for the bounded LLM deep-dive (per-check override allowed)
+deep_dive:
+  enabled: auto              # auto | off
+  trigger: low_confidence    # low_confidence | high_severity | always
+  max_extra_charts: 5        # hard cap on additional charts per finding
+  max_steps: 6               # hard cap on investigation loop iterations
+  scope:
+    dashboard_ids: [12, 18]  # the ONLY dashboards the LLM may explore
+
 checks:
   - id: payment_success_rate
     name: "Payment Success Rate"
@@ -116,6 +151,7 @@ checks:
         describe: "success rate by bank / issuer"
       - chart_id: 419
         describe: "top failure reason codes"
+    deep_dive: auto                # per-check override: auto | off
     severity: high                 # high | medium | low
 
   - id: txn_volume
@@ -129,6 +165,7 @@ checks:
     drilldown:
       - chart_id: 421
         describe: "volume by channel and merchant"
+    deep_dive: off                 # deterministic-only for this check
     severity: medium
 ```
 
@@ -141,7 +178,19 @@ checks:
 - `drilldown` — ordered list of detail charts (the fixed map). Fetched in
   sequence **only when the check is abnormal**. Default behavior: **fetch all**
   charts in the list. (Optional future `stop_when` to short-circuit.)
+- `deep_dive` — `auto` (allow bounded escalation per the global rules) or `off`
+  (force deterministic-only for this check). Overrides the global default.
 - `severity` — controls report ordering/surfacing.
+
+### Deep-dive config (global `deep_dive`)
+- `enabled` — `auto` lets checks escalate; `off` disables it system-wide.
+- `trigger` — `low_confidence` (default; escalate only when the LLM cannot
+  confidently explain the anomaly from the data it has), `high_severity` (only
+  for high-severity anomalies), or `always` (any anomaly).
+- `max_extra_charts` / `max_steps` — hard budget; the loop stops when either is
+  reached and reports with what it has.
+- `scope.dashboard_ids` — the **only** dashboards the LLM may read during a
+  deep-dive. Anything outside this list is off-limits.
 
 ### Baselines
 - The baseline for a `deviation` rule **always comes from the chart's own data**
@@ -160,11 +209,49 @@ checks:
    a. Fetch `summary_chart_id` data via Superset.
    b. Read `metric`; evaluate all `rules`.
    c. If abnormal → fetch each `drilldown` chart in order.
-   d. Hand summary + drill-down trail to the LLM → plain-language reason.
-3. Assemble all findings into report JSON (verdict, anomalies, checked list).
+   d. Hand summary + drill-down trail to the LLM → plain-language reason **plus a
+      confidence self-assessment**.
+   e. If the deep-dive `trigger` condition is met (e.g. low confidence) and
+      deep-dive is enabled for this check → run the bounded investigation loop
+      (§6.1), then re-derive the reason from the enriched trail.
+3. Assemble all findings into report JSON (verdict, anomalies, checked list,
+   deep-dive tags).
 4. Return JSON to caller (Teams Workflow renders it).
 
 On-demand and scheduled triggers call the **same engine** — identical output.
+
+### 6.1 Bounded deep-dive loop
+
+Triggered only for an abnormal check when `trigger` matches and deep-dive is
+enabled. The loop is the single place the LLM drives control flow, and it is
+tightly constrained:
+
+```
+state: anomaly + fixed drill-down trail; budget = (max_extra_charts, max_steps)
+loop:
+  1. LLM assesses: can I now explain the root cause confidently?
+       yes  → exit loop
+       no   → continue
+  2. budget exhausted? → exit loop (report best-effort with what we have)
+  3. LLM picks ONE next chart to inspect:
+       - may call list_charts(dashboard_id) within scope.dashboard_ids
+       - may call get_chart_data(chart_id) for a chart in scope
+  4. fetched data appended to the trail; decrement budget; record in run log
+exit: LLM writes the final plain-language reason from the full trail
+```
+
+**Invariants / guardrails**
+- **Read-only only** — tools are limited to `list_charts` and `get_chart_data`.
+  No SQL, no writes, no actions on any system.
+- **Scope-bound** — only charts on `scope.dashboard_ids` are reachable; a request
+  outside scope is refused and logged.
+- **Budget-bound** — stops at `max_extra_charts` or `max_steps`, whichever first.
+- **Fully logged** — every tool call, chart fetched, and reasoning step recorded
+  for audit.
+- **Fail-safe** — on timeout/error mid-loop, fall back to the deterministic
+  findings + best-effort reason; the run never fails because of a deep-dive.
+- **Transparent** — findings that used a deep-dive are tagged in the report
+  (e.g. `🔎 deep-dive: examined N extra charts`).
 
 ## 7. Teams integration
 
@@ -210,6 +297,7 @@ All 8 monitored metrics are within normal range.
    where declines tripled overnight. Top reason code is
    "do not honour" (54% of failures), pointing to an
    issuer-side problem rather than our gateway.
+   🔎 deep-dive: examined 3 extra charts
    🔗 Open dashboard
 ──────────────────────────────
 🟡 MEDIUM · Transaction Volume
@@ -228,6 +316,8 @@ Chargebacks, Latency, Active Users, Revenue.
 - Each anomaly shows **numbers** (now vs threshold/baseline) **and** the
   plain-language **reason** from the drill-down trail.
 - **Severity ordering + color dots** — worst first.
+- **Deep-dive tag** — when a finding went beyond the fixed drill-down, it's
+  flagged so you know the reasoning used extra investigation (transparency).
 - **"Checked:" footer** — confirms full coverage, builds trust.
 - **Deep link** back to Superset per finding.
 
@@ -240,8 +330,11 @@ Chargebacks, Latency, Active Users, Revenue.
 - **Superset connectivity:** short retry with backoff (e.g. 2 retries). If fully
   unreachable, post a single clear failure message to Teams.
 - **LLM failures:** still report raw numbers + drill-down data without the prose.
+- **Deep-dive failures:** on timeout, budget exhaustion, or error inside the
+  loop, fall back to the deterministic findings + best-effort reason. A deep-dive
+  never blocks or fails the run.
 - **Run log:** per-run, per-check record (fetched data, rule outcome,
-  conclusion) for audit and debugging.
+  conclusion, and every deep-dive tool call/step) for audit and debugging.
 - **Config validation:** validate the playbook on startup; typos fail fast with
   a clear message.
 
@@ -254,7 +347,13 @@ Chargebacks, Latency, Active Users, Revenue.
 - **Superset client tests:** mocked responses incl. timeouts and empty data;
   verify per-check isolation and retry behavior.
 - **Report formatting tests:** findings → correct render JSON (all-clear, single
-  anomaly, multiple severities, "could not evaluate").
+  anomaly, multiple severities, "could not evaluate", deep-dive tag).
+- **Deep-dive guardrail tests:** loop respects `max_extra_charts`/`max_steps`;
+  refuses charts outside `scope.dashboard_ids`; falls back cleanly on
+  timeout/error; never calls a write/non-read-only tool. Use a mocked LLM that
+  requests an out-of-scope chart and an over-budget number of steps.
+- **Trigger tests:** `low_confidence` / `high_severity` / `always` each escalate
+  in the right cases and not otherwise.
 - **End-to-end dry run:** `--dry-run` mode runs the real playbook against
   Superset and prints the report to console — no Teams, no schedule. Primary
   way to validate against real dashboards before go-live.
@@ -267,4 +366,8 @@ Chargebacks, Latency, Active Users, Revenue.
 - Concrete Adaptive Card JSON template.
 - Click-by-click Teams Workflow setup steps for the admin team.
 - Initial real playbook content (the actual charts/metrics/thresholds to watch).
+- How the LLM's confidence self-assessment is captured/measured to drive the
+  `low_confidence` trigger (e.g. structured "confident: yes/no + why" output).
+- Default deep-dive budget values (`max_extra_charts`, `max_steps`) and per-run
+  cost ceiling.
 ```
