@@ -1,0 +1,39 @@
+# Edit this file to configure your monitoring checks.
+# chart_id values below are examples — replace with your real Superset chart IDs.
+
+deep_dive:
+  enabled: auto
+  trigger: low_confidence
+  max_extra_charts: 5
+  max_steps: 6
+  scope:
+    dashboard_ids: []
+
+checks:
+  - id: growth_rate
+    name: "Growth rate"
+    summary_chart_id: 18
+    metric: "sum__SP_POP_TOTL, France"
+    rules:
+      - type: threshold
+        op: ">="
+        value: 50000000
+      - type: deviation
+        compare_to: yesterday
+        max_drop_pct: 2.0
+    drilldown:
+      - chart_id: 9
+        describe: "revenue by deal size"
+    deep_dive: "auto"
+    severity: high
+
+  - id: top_games
+    name: "Top 10 Games: Proportion of Sales in Markets"
+    summary_chart_id: 28
+    metric: "Europe, Duck Hunt"
+    rules:
+      - type: deviation
+        compare_to: last_week
+        max_drop_pct: 15.0
+    deep_dive: "off"
+    severity: medium
