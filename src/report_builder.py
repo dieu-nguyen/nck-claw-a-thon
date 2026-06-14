@@ -1,46 +1,33 @@
 from __future__ import annotations
 
 from src.engine import CheckResult
-from src.llm_reporter import ReasonResponse
 
-_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+_STATUS_ORDER = {"critical": 0, "warning": 1, "normal": 2}
 
 
-def build_report(
-    results: list[CheckResult],
-    reasons: dict[str, ReasonResponse],
-    run_ts: str,
-) -> dict:
+def build_report(results: list[CheckResult], run_ts: str) -> dict:
     anomalies = []
     errors = []
     checked_names = []
 
     for cr in results:
-        checked_names.append(cr.name)
+        checked_names.append(cr.check_name)
         if cr.error:
-            errors.append({"check_id": cr.check_id, "name": cr.name, "message": cr.error})
+            errors.append({"check_id": cr.check_id, "name": cr.check_name, "message": cr.error})
             continue
         if not cr.is_abnormal:
             continue
-        reason_resp = reasons.get(cr.check_id)
-        anomalies.append(
-            {
-                "check_id": cr.check_id,
-                "name": cr.name,
-                "severity": cr.severity,
-                "current_value": cr.current_value,
-                "triggered_rules": cr.rule_result.triggered_rules if cr.rule_result else [],
-                "skipped_rules": cr.rule_result.skipped_rules if cr.rule_result else [],
-                "reason": reason_resp.reason if reason_resp else "",
-                "deep_dive_tag": (
-                    f"deep-dive: examined {cr.deep_dive_charts_examined} extra charts"
-                    if cr.deep_dive_used
-                    else None
-                ),
-            }
-        )
+        anomalies.append({
+            "check_id": cr.check_id,
+            "name": cr.check_name,
+            "status": cr.status,
+            "summary": cr.summary,
+            "analysis": cr.analysis,
+            "recommendations": cr.recommendations,
+            "extra_charts_fetched": cr.extra_charts_fetched,
+        })
 
-    anomalies.sort(key=lambda a: _SEVERITY_ORDER.get(a["severity"], 99))
+    anomalies.sort(key=lambda a: _STATUS_ORDER.get(a["status"], 99))
 
     return {
         "status": "all_clear" if not anomalies else "issues_found",

@@ -1,4 +1,5 @@
 import json
+import re
 
 import httpx
 import pytest
@@ -94,3 +95,47 @@ async def test_list_charts_success(client, httpx_mock: HTTPXMock):
     )
     charts = await client.list_charts(dashboard_id=12)
     assert charts[0]["id"] == 415
+
+
+@pytest.mark.asyncio
+async def test_search_charts_returns_matching(client, httpx_mock: HTTPXMock):
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(
+        method="GET",
+        url=re.compile(rf"{re.escape(BASE)}/api/v1/chart/"),
+        json={
+            "result": [
+                {"id": 412, "slice_name": "Bank Link SR Overview", "description": ""},
+                {"id": 413, "slice_name": "Bank Link SR Daily", "description": ""},
+            ]
+        },
+    )
+    charts = await client.search_charts("Bank Link SR")
+    assert len(charts) == 2
+    assert charts[0] == {"id": 412, "name": "Bank Link SR Overview", "description": ""}
+    assert charts[1]["id"] == 413
+
+
+@pytest.mark.asyncio
+async def test_search_charts_empty_result(client, httpx_mock: HTTPXMock):
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(method="GET", url=re.compile(rf"{re.escape(BASE)}/api/v1/chart/"), json={"result": []})
+    charts = await client.search_charts("nonexistent")
+    assert charts == []
+
+
+@pytest.mark.asyncio
+async def test_search_dashboards_returns_matching(client, httpx_mock: HTTPXMock):
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(
+        method="GET",
+        url=re.compile(rf"{re.escape(BASE)}/api/v1/dashboard/\?"),
+        json={
+            "result": [
+                {"id": 12, "dashboard_title": "Bank Link Dashboard", "url": "/superset/dashboard/12/"},
+            ]
+        },
+    )
+    dashboards = await client.search_dashboards("Bank Link")
+    assert len(dashboards) == 1
+    assert dashboards[0] == {"id": 12, "name": "Bank Link Dashboard", "url": "/superset/dashboard/12/"}

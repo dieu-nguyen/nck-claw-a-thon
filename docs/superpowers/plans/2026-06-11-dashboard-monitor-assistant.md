@@ -1,12 +1,17 @@
 # Dashboard Monitoring Assistant — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: STALE — superseded by implementation as of 2026-06-14.**
+> The architecture diverged significantly from this plan during implementation.
+> This file is kept for historical reference only.
+> See the current design spec at `docs/superpowers/specs/2026-06-11-dashboard-monitor-assistant-design.md` for what was actually built.
 
-**Goal:** Build a fintech monitoring agent that scans Superset dashboards daily, detects metric anomalies via a declarative playbook, drills into detail charts, optionally escalates to a bounded LLM deep-dive, and returns a structured JSON report consumed by a Teams Workflow Adaptive Card.
+---
 
-**Architecture:** Deterministic monitoring engine (playbook → fetch → rule eval → fixed drill-down) with a bounded agentic LLM escalation when the fixed drill-down doesn't explain the anomaly. Single FastAPI `/run` endpoint on GreenNode AgentBase; Teams Workflows handle scheduling and rendering.
+**Original goal (for reference):** Build a fintech monitoring agent that scans Superset dashboards daily, detects metric anomalies via a declarative playbook, drills into detail charts, optionally escalates to a bounded LLM deep-dive, and returns a structured JSON report consumed by a Teams Workflow Adaptive Card.
 
-**Tech Stack:** Python 3.11, FastAPI, Pydantic v2, PyYAML, httpx (async), openai SDK (AgentBase LLM), pytest + pytest-asyncio, Docker.
+**What was actually built instead:** Prompt-driven LLM agent loop — no playbook, no rule engine, no fixed drill-down. Each monitoring flow is a natural-language `.md` file in `prompts/`. The agent fetches charts by name or ID autonomously, reasons over the data, and posts a plain-text report directly to Teams via incoming webhook. See the spec for full details.
+
+---
 
 ---
 
