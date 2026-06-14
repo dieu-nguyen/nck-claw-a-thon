@@ -9,3 +9,5 @@ logs/
 logs/
 .greennode.json.agentbase/
 .agentbase/
+.greennode.json
+.dockerignore
