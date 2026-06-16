@@ -198,6 +198,18 @@ async def _run_prompt(
                          is_abnormal=cr.is_abnormal, status=cr.status,
                          summary=cr.summary, analysis=cr.analysis,
                          recommendations=cr.recommendations)
+                await emit(json.dumps({
+                    "__task_result__": {
+                        "check_id": cr.check_id,
+                        "check_name": cr.check_name,
+                        "is_abnormal": cr.is_abnormal,
+                        "status": cr.status,
+                        "summary": cr.summary,
+                        "analysis": cr.analysis,
+                        "recommendations": cr.recommendations,
+                        "error": cr.error,
+                    }
+                }, ensure_ascii=False))
                 return cr
 
             messages.append({"role": "assistant", "content": raw})
@@ -271,7 +283,13 @@ async def _run_prompt(
                 try:
                     dashboards = await client.search_dashboards(name)
                     if dashboards:
+                        dashboard_id = dashboards[0].get("id")
                         await emit(f"🔍 Đã tìm thấy dashboard: \"{dashboards[0]['name']}\"")
+                        if dashboard_id:
+                            await emit(json.dumps({
+                                "__dashboard_id__": dashboard_id,
+                                "check_id": check_id,
+                            }, ensure_ascii=False))
                     tool_content = f"Dashboards matching '{name}': {json.dumps(dashboards, default=str)[:2000]}"
                     messages.append({"role": "user", "content": tool_content})
                     log_step(steps, action="search_dashboards", llm_raw=raw,
@@ -347,6 +365,18 @@ async def _run_prompt(
         cr.analysis = parsed.get("analysis", "")
         cr.recommendations = parsed.get("recommendations", [])
         cr.extra_charts_fetched = extra_charts
+        await emit(json.dumps({
+            "__task_result__": {
+                "check_id": cr.check_id,
+                "check_name": cr.check_name,
+                "is_abnormal": cr.is_abnormal,
+                "status": cr.status,
+                "summary": cr.summary,
+                "analysis": cr.analysis,
+                "recommendations": cr.recommendations,
+                "error": cr.error,
+            }
+        }, ensure_ascii=False))
         return cr
 
     except SupersetError as e:
@@ -354,6 +384,18 @@ async def _run_prompt(
     except Exception as e:
         cr.error = f"Unexpected error: {e}"
 
+    await emit(json.dumps({
+        "__task_result__": {
+            "check_id": cr.check_id,
+            "check_name": cr.check_name,
+            "is_abnormal": False,
+            "status": "error",
+            "summary": cr.error or "Unknown error",
+            "analysis": "",
+            "recommendations": [],
+            "error": cr.error,
+        }
+    }, ensure_ascii=False))
     return cr
 
 
@@ -363,12 +405,12 @@ async def run_engine(
     on_step: StepCallback | None = None,
     log: RunLog | None = None,
 ) -> list[CheckResult]:
+    import asyncio as _asyncio
     prompt_files = sorted(Path(prompts_dir).glob("*.md"))
     if not prompt_files:
         raise FileNotFoundError(f"No .md prompt files found in: {prompts_dir}")
 
-    results: list[CheckResult] = []
-    for prompt_path in prompt_files:
-        result = await _run_prompt(prompt_path, client, on_step=on_step, log=log)
-        results.append(result)
-    return results
+    results = await _asyncio.gather(
+        *[_run_prompt(p, client, on_step=on_step, log=log) for p in prompt_files]
+    )
+    return list(results)

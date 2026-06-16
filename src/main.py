@@ -230,7 +230,6 @@ async def health():
 async def dashboard_ui():
     token = os.getenv("API_TOKEN", "")
     superset_base = os.getenv("SUPERSET_BASE_URL", "").rstrip("/")
-    dashboard_link = f"{superset_base}/superset/dashboard/10/" if superset_base else ""
     html = f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -300,9 +299,10 @@ async def dashboard_ui():
     #task-boxes {{
       margin-top: 24px;
       width: 100%;
-      max-width: 800px;
+      max-width: 1200px;
       display: none;
-      flex-direction: column;
+      flex-direction: row;
+      flex-wrap: wrap;
       gap: 16px;
     }}
     .task-box {{
@@ -310,6 +310,8 @@ async def dashboard_ui():
       border: 1px solid #e2e8f0;
       border-radius: 10px;
       overflow: hidden;
+      flex: 1 1 calc(50% - 8px);
+      min-width: 320px;
     }}
     /* colour-coded left border per status */
     .task-box.status-ok    {{ border-left: 4px solid #22c55e; }}
@@ -411,7 +413,9 @@ async def dashboard_ui():
 
   <script>
     const API_TOKEN = "{token}";
-    const DASHBOARD_LINK = "{dashboard_link}";
+    const SUPERSET_BASE = "{superset_base}";
+    // map check_id → superset dashboard URL (populated when task result arrives)
+    const taskDashboardLinks = {{}};
     let running = false;
     let timerInterval = null;
     let startTime = null;
@@ -502,12 +506,16 @@ async def dashboard_ui():
 
       const status = resultData.status || "normal";
       const isAbnormal = resultData.is_abnormal;
+      const isError = status === "error";
       const summary = resultData.summary || "";
       const analysis = resultData.analysis || "";
       const recs = resultData.recommendations || [];
 
       let statusLabel, statusCls, icon, boxCls, bannerText;
-      if (!isAbnormal) {{
+      if (isError) {{
+        statusLabel = "Lỗi"; statusCls = "critical"; icon = "❌"; boxCls = "status-error";
+        bannerText = "❌ Lỗi xử lý tác vụ";
+      }} else if (!isAbnormal) {{
         statusLabel = "Bình thường"; statusCls = "ok"; icon = "✅"; boxCls = "status-ok";
         bannerText = "✅ Tất cả chỉ số bình thường";
       }} else if (status === "critical") {{
@@ -529,9 +537,10 @@ async def dashboard_ui():
       statusBar.className = `task-status-bar ${{statusCls}}`;
       statusBar.style.display = "block";
 
-      // Meta bar
-      const linkHtml = DASHBOARD_LINK
-        ? `<a href="${{DASHBOARD_LINK}}" target="_blank">📊 Mở dashboard →</a>`
+      // Meta bar — per-task dashboard link
+      const dashLink = taskDashboardLinks[checkId] || "";
+      const linkHtml = dashLink
+        ? `<a href="${{dashLink}}" target="_blank">📊 Mở dashboard →</a>`
         : "";
       metaBar.innerHTML = `<span>🕐 ${{runTs}} UTC</span><span>⏱ ${{elapsedStr}}</span>${{linkHtml}}`;
       metaBar.style.display = "flex";
@@ -580,31 +589,27 @@ async def dashboard_ui():
           return;
         }}
 
-        if (data.__report__) {{
-          const r = data.__report__;
+        if (data.__dashboard_id__ !== undefined) {{
+          const checkId = data.check_id;
+          if (SUPERSET_BASE && checkId) {{
+            taskDashboardLinks[checkId] = `${{SUPERSET_BASE}}/superset/dashboard/${{data.__dashboard_id__}}/`;
+          }}
+          return;
+        }}
+
+        if (data.__task_result__) {{
+          const r = data.__task_result__;
+          const checkId = r.check_id;
           const elapsed = Math.round((Date.now() - startTime) / 1000);
           const elapsedStr = elapsed >= 60
             ? `Hoàn thành trong ${{Math.floor(elapsed/60)}}m ${{elapsed%60}}s`
             : `Hoàn thành trong ${{elapsed}}s`;
-          const runTs = r.run_ts || "";
+          finalizeTaskBox(checkId, r, new Date().toISOString().replace("T"," ").slice(0,19), elapsedStr);
+          return;
+        }}
 
-          // Finalize each task box
-          const allChecks = [
-            ...(r.anomalies || []),
-            ...(r.normal || []).map(n => ({{ ...n, is_abnormal: false, status: "normal", analysis: "", recommendations: [] }})),
-          ];
-          for (const check of allChecks) {{
-            if (check.check_id && taskBoxes[check.check_id]) {{
-              finalizeTaskBox(check.check_id, check, runTs, elapsedStr);
-            }}
-          }}
-          // Fallback for any box without a result entry (e.g. engine error)
-          for (const [id, box] of Object.entries(taskBoxes)) {{
-            if (box.headerBadge && box.headerBadge.className.includes("running")) {{
-              finalizeTaskBox(id, {{ is_abnormal: false, status: "normal", summary: "", analysis: "", recommendations: [] }}, runTs, elapsedStr);
-            }}
-          }}
-
+        if (data.__report__) {{
+          const r = data.__report__;
           es.close();
           stopTimer();
           running = false;
