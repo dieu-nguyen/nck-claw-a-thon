@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import smtplib
 from dataclasses import dataclass, field
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 
@@ -11,22 +13,29 @@ from openai import AsyncOpenAI
 from src.superset_client import SupersetClient, SupersetError
 
 _AGENT_SYSTEM_PROMPT = """\
-You are a fintech monitoring analyst. You have access to four read-only tools:
+You are a fintech monitoring analyst. You have access to five tools:
+
+Read-only data tools:
   - search_charts(name): search for charts by name (substring match), returns list of {id, name}
   - search_dashboards(name): search for dashboards by name (substring match), returns list of {id, name}
   - get_chart_data(chart_id): fetch the data for a specific chart by numeric ID
   - list_charts(dashboard_id): list all charts on a dashboard by numeric dashboard ID
 
+Delivery tool:
+  - send_email(to, subject, body): send an email report. `to` is a comma-separated list of recipients.
+
 Use search_charts or search_dashboards first when you only know a name, then use the
 returned ID to call get_chart_data or list_charts.
 
-At each step, respond ONLY with valid JSON in one of two schemas:
-1. To use a tool:
+At each step, respond ONLY with valid JSON in one of these schemas:
+1. To use a data tool:
    {"action": "search_charts", "args": {"name": "<partial name>"}}
    {"action": "search_dashboards", "args": {"name": "<partial name>"}}
    {"action": "get_chart_data", "args": {"chart_id": <int>}}
    {"action": "list_charts", "args": {"dashboard_id": <int>}}
-2. When you have enough information to conclude:
+2. To send an email:
+   {"action": "send_email", "args": {"to": "<email1,email2>", "subject": "<subject>", "body": "<body text>"}}
+3. When you have finished all work (after sending email if required):
    {
      "action": "done",
      "is_abnormal": true|false,
@@ -40,7 +49,34 @@ Follow the instructions in your user message carefully.
 Stop as soon as you have enough data to reach a conclusion.
 """
 
-_MAX_STEPS = 12
+_MAX_STEPS = 50  # extra headroom for send_email step
+
+
+def _execute_send_email(to: str, subject: str, body: str) -> str:
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_password = os.environ.get("SMTP_PASSWORD", "")
+    email_from = os.environ.get("EMAIL_FROM", smtp_user)
+
+    if not email_from:
+        return "Error: EMAIL_FROM / SMTP_USER not configured"
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = email_from
+    msg["To"] = to
+
+    recipients = [r.strip() for r in to.split(",") if r.strip()]
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.sendmail(email_from, recipients, msg.as_string())
+        return f"Email sent to {to}"
+    except Exception as e:
+        return f"Error sending email: {e}"
 
 
 @dataclass
@@ -81,26 +117,37 @@ async def _run_prompt(prompt_path: Path, client: SupersetClient) -> CheckResult:
         while steps < _MAX_STEPS:
             response = await llm_client.chat.completions.create(
                 model=llm_model,
-                max_tokens=2048,
+                max_tokens=4096,
                 messages=messages,
             )
             steps += 1
-            raw = response.choices[0].message.content
+            raw = response.choices[0].message.content or ""
 
+            parsed = None
             try:
                 parsed = json.loads(raw)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 import re
                 match = re.search(r'\{.*\}', raw, re.DOTALL)
                 if match:
                     try:
                         parsed = json.loads(match.group())
-                    except json.JSONDecodeError:
-                        cr.error = f"LLM returned invalid JSON at step {steps}"
-                        return cr
-                else:
-                    cr.error = f"LLM returned invalid JSON at step {steps}"
-                    return cr
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            if parsed is None:
+                # Model responded with plain text — nudge it back to JSON
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your last response was not valid JSON. "
+                        "You MUST respond with ONLY a JSON object — no prose, no markdown, no explanation. "
+                        'Either call a tool: {"action": "...", "args": {...}} '
+                        'or conclude: {"action": "done", "is_abnormal": ..., "status": ..., '
+                        '"summary": "...", "analysis": "...", "recommendations": [...]}.'
+                    ),
+                })
+                continue
 
             action = parsed.get("action")
 
@@ -134,9 +181,11 @@ async def _run_prompt(prompt_path: Path, client: SupersetClient) -> CheckResult:
                 dashboard_id = parsed["args"]["dashboard_id"]
                 try:
                     charts = await client.list_charts(dashboard_id)
+                    # Trim to id+name only so the agent can easily pick chart IDs
+                    slim = [{"id": c.get("id"), "name": c.get("slice_name", "")} for c in charts]
                     messages.append({
                         "role": "user",
-                        "content": f"Charts on dashboard {dashboard_id}: {json.dumps(charts, default=str)[:2000]}",
+                        "content": f"Charts on dashboard {dashboard_id}: {json.dumps(slim, default=str)}",
                     })
                 except SupersetError as e:
                     messages.append({
@@ -172,6 +221,18 @@ async def _run_prompt(prompt_path: Path, client: SupersetClient) -> CheckResult:
                         "content": f"Error searching dashboards for '{name}': {e}",
                     })
 
+            elif action == "send_email":
+                args = parsed.get("args", {})
+                result = _execute_send_email(
+                    to=args.get("to", ""),
+                    subject=args.get("subject", ""),
+                    body=args.get("body", ""),
+                )
+                messages.append({
+                    "role": "user",
+                    "content": result,
+                })
+
             else:
                 messages.append({
                     "role": "user",
@@ -192,10 +253,10 @@ async def _run_prompt(prompt_path: Path, client: SupersetClient) -> CheckResult:
         })
         response = await llm_client.chat.completions.create(
             model=llm_model,
-            max_tokens=2048,
+            max_tokens=4096,
             messages=messages,
         )
-        raw = response.choices[0].message.content
+        raw = response.choices[0].message.content or ""
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:

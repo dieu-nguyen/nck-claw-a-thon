@@ -103,30 +103,26 @@ class SupersetClient:
         )
         return result.get("result", [])
 
-    async def search_charts(self, name: str, page_size: int = 20) -> list[dict]:
+    async def search_charts(self, name: str, page_size: int = 100) -> list[dict]:
         """Return charts whose name contains `name` (case-insensitive substring match)."""
-        import urllib.parse
-        q = urllib.parse.quote(
-            f"(filters:!((col:slice_name,opr:ChartAllTextSearch,val:'{name}')),page_size:{page_size})"
-        )
         result = await self._request_with_retry_new_session(
-            "GET", f"{self._base}/api/v1/chart/?q={q}"
+            "GET", f"{self._base}/api/v1/chart/?page_size={page_size}"
         )
+        needle = name.lower()
         return [
             {"id": r["id"], "name": r.get("slice_name", ""), "description": r.get("description", "")}
             for r in result.get("result", [])
+            if needle in r.get("slice_name", "").lower()
         ]
 
-    async def search_dashboards(self, name: str, page_size: int = 20) -> list[dict]:
+    async def search_dashboards(self, name: str, page_size: int = 100) -> list[dict]:
         """Return dashboards whose title contains `name` (case-insensitive substring match)."""
-        import urllib.parse
-        q = urllib.parse.quote(
-            f"(filters:!((col:dashboard_title,opr:AllTextSearch,val:'{name}')),page_size:{page_size})"
-        )
         result = await self._request_with_retry_new_session(
-            "GET", f"{self._base}/api/v1/dashboard/?q={q}"
+            "GET", f"{self._base}/api/v1/dashboard/?page_size={page_size}"
         )
+        needle = name.lower()
         return [
             {"id": r["id"], "name": r.get("dashboard_title", ""), "url": r.get("url", "")}
             for r in result.get("result", [])
+            if needle in r.get("dashboard_title", "").lower()
         ]
