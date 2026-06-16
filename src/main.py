@@ -170,6 +170,8 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 async def dashboard_ui():
     token = os.getenv("API_TOKEN", "")
+    superset_base = os.getenv("SUPERSET_BASE_URL", "").rstrip("/")
+    dashboard_link = f"{superset_base}/superset/dashboard/10/" if superset_base else ""
     html = f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -205,14 +207,30 @@ async def dashboard_ui():
     #run-btn:active:not(:disabled) {{ transform: scale(0.97); }}
     #run-btn:disabled {{ background: #bfdbfe; color: #93c5fd; cursor: not-allowed; }}
     #status {{
-      margin-top: 24px;
+      margin-top: 20px;
       font-size: 0.875rem;
       color: #64748b;
       min-height: 20px;
+      text-align: center;
+    }}
+    #hint {{
+      margin-top: 8px;
+      font-size: 0.8rem;
+      color: #94a3b8;
+      min-height: 16px;
+      text-align: center;
+    }}
+    #timer {{
+      margin-top: 6px;
+      font-size: 0.8rem;
+      color: #94a3b8;
+      font-variant-numeric: tabular-nums;
+      min-height: 16px;
+      text-align: center;
     }}
     #spinner {{
       display: none;
-      margin-top: 24px;
+      margin-top: 20px;
       width: 32px; height: 32px;
       border: 3px solid #e2e8f0;
       border-top-color: #3b82f6;
@@ -228,7 +246,7 @@ async def dashboard_ui():
       font-weight: 700;
     }}
     .all-clear {{ background: #f0fdf4; border: 1px solid #86efac; color: #15803d; }}
-    .issues {{ background: #fff1f2; border: 1px solid #fca5a5; color: #b91c1c; }}
+    .has-alerts {{ background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; }}
     .meta {{
       padding: 12px 24px;
       background: #f8fafc;
@@ -236,6 +254,9 @@ async def dashboard_ui():
       color: #94a3b8;
       border-left: 1px solid #e2e8f0;
       border-right: 1px solid #e2e8f0;
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
     }}
     .anomaly {{
       margin-top: 1px;
@@ -254,11 +275,11 @@ async def dashboard_ui():
     .error-block {{
       margin-top: 1px;
       padding: 16px 24px;
-      background: #fffbeb;
-      border-left: 4px solid #f59e0b;
+      background: #fff7ed;
+      border-left: 4px solid #f97316;
       border-right: 1px solid #e2e8f0;
       font-size: 0.85rem;
-      color: #92400e;
+      color: #9a3412;
     }}
     .footer {{
       padding: 14px 24px;
@@ -268,7 +289,18 @@ async def dashboard_ui():
       border-radius: 0 0 10px 10px;
       font-size: 0.8rem;
       color: #94a3b8;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
     }}
+    .footer a {{
+      color: #3b82f6;
+      text-decoration: none;
+      font-size: 0.8rem;
+    }}
+    .footer a:hover {{ text-decoration: underline; }}
     .normal-block {{
       margin-top: 1px;
       padding: 16px 24px;
@@ -285,64 +317,106 @@ async def dashboard_ui():
   <p class="subtitle">Bank Link SR — Monitoring Assistant</p>
   <button id="run-btn" onclick="runMonitor()">▶ Run Now</button>
   <div id="status"></div>
+  <div id="hint"></div>
+  <div id="timer"></div>
   <div id="spinner"></div>
   <div id="report"></div>
 
   <script>
     const API_TOKEN = "{token}";
+    const DASHBOARD_LINK = "{dashboard_link}";
     let running = false;
+    let timerInterval = null;
+    let startTime = null;
+
+    function startTimer() {{
+      startTime = Date.now();
+      timerInterval = setInterval(() => {{
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        const m = Math.floor(elapsed / 60);
+        const s = elapsed % 60;
+        document.getElementById("timer").textContent =
+          `⏱ ${{m > 0 ? m + "m " : ""}}${{s}}s elapsed`;
+      }}, 1000);
+    }}
+
+    function stopTimer() {{
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }}
 
     async function runMonitor() {{
       if (running) return;
       running = true;
 
       document.getElementById("run-btn").disabled = true;
-      document.getElementById("run-btn").textContent = "Running…";
+      document.getElementById("run-btn").textContent = "Analysing…";
       document.getElementById("report").style.display = "none";
       document.getElementById("report").innerHTML = "";
       document.getElementById("spinner").style.display = "block";
-      document.getElementById("status").textContent = "Agent is fetching data and analysing…";
+      document.getElementById("status").textContent = "🤖 Agent đang đọc dashboard và phân tích dữ liệu…";
+      document.getElementById("hint").textContent = "Thường mất khoảng 2–3 phút, vui lòng chờ.";
+      document.getElementById("timer").textContent = "";
+      startTimer();
 
+      let elapsed = 0;
       try {{
         const res = await fetch("/run", {{
           method: "POST",
           headers: {{ "Authorization": "Bearer " + API_TOKEN }}
         }});
+        elapsed = Math.round((Date.now() - startTime) / 1000);
         if (!res.ok) {{
           const err = await res.json().catch(() => ({{}}));
           throw new Error(err.detail || res.statusText);
         }}
         const data = await res.json();
-        renderReport(data);
+        renderReport(data, elapsed);
         document.getElementById("status").textContent = "";
+        document.getElementById("hint").textContent = "";
+        document.getElementById("timer").textContent = "";
       }} catch (e) {{
-        document.getElementById("status").textContent = "❌ Error: " + e.message;
+        document.getElementById("status").textContent = "❌ Lỗi: " + e.message;
+        document.getElementById("hint").textContent = "";
       }} finally {{
         running = false;
+        stopTimer();
         document.getElementById("spinner").style.display = "none";
         document.getElementById("run-btn").disabled = false;
-        document.getElementById("run-btn").textContent = "▶ Run Again";
+        document.getElementById("run-btn").textContent = "▶ Chạy lại";
       }}
     }}
 
-    function renderReport(r) {{
+    function renderReport(r, elapsed) {{
       const el = document.getElementById("report");
       const ts = r.run_ts || "";
       const anomalyCount = r.anomaly_count || 0;
       const total = r.total_checked || 0;
       const checked = (r.checked_names || []).join(", ");
-      const isOk = anomalyCount === 0 && (r.errors || []).length === 0;
+      const hasErrors = (r.errors || []).length > 0;
+      const isOk = anomalyCount === 0 && !hasErrors;
+      const elapsedStr = elapsed >= 60
+        ? `${{Math.floor(elapsed/60)}}m ${{elapsed%60}}s`
+        : `${{elapsed}}s`;
 
       let html = "";
 
-      // Header
+      // Header — friendly wording
       if (isOk) {{
-        html += `<div class="report-header all-clear">✅ All Clear — ${{anomalyCount === 0 ? "All checks normal" : ""}}</div>`;
+        html += `<div class="report-header all-clear">✅ Tất cả bình thường</div>`;
+      }} else if (anomalyCount > 0) {{
+        const worst = (r.anomalies || []).some(a => a.status === "critical") ? "🔴 Cần chú ý" : "⚠️ Cần theo dõi";
+        html += `<div class="report-header has-alerts">${{worst}} — ${{anomalyCount}} luồng phát hiện bất thường</div>`;
       }} else {{
-        html += `<div class="report-header issues">⚠️ ${{anomalyCount}} issue${{anomalyCount !== 1 ? "s" : ""}} found</div>`;
+        html += `<div class="report-header has-alerts">⚠️ Có lỗi xử lý trong quá trình chạy</div>`;
       }}
 
-      html += `<div class="meta">Run: ${{ts}} UTC &nbsp;·&nbsp; Checked ${{total}} flow${{total !== 1 ? "s" : ""}}</div>`;
+      // Meta bar
+      html += `<div class="meta">
+        <span>🕐 ${{ts}} UTC</span>
+        <span>⏱ Hoàn thành trong ${{elapsedStr}}</span>
+        <span>📋 Đã kiểm tra ${{total}} luồng</span>
+      </div>`;
 
       // Anomalies
       for (const a of (r.anomalies || [])) {{
@@ -361,20 +435,26 @@ async def dashboard_ui():
         html += `</div>`;
       }}
 
-      // Normal flows (all clear)
+      // Normal flows
       if (isOk) {{
         for (const name of (r.checked_names || [])) {{
-          html += `<div class="normal-block">✅ ${{name}} — normal</div>`;
+          html += `<div class="normal-block">✅ ${{name}} — bình thường</div>`;
         }}
       }}
 
-      // Errors
+      // Engine errors
       for (const e of (r.errors || [])) {{
-        html += `<div class="error-block">❌ ${{e.name}} — ${{e.message}}</div>`;
+        html += `<div class="error-block">⚠️ Lỗi xử lý: ${{e.name}} — ${{e.message}}</div>`;
       }}
 
-      // Footer
-      html += `<div class="footer">Checked: ${{checked}}</div>`;
+      // Footer with dashboard link
+      const linkHtml = DASHBOARD_LINK
+        ? `<a href="${{DASHBOARD_LINK}}" target="_blank">📊 Mở dashboard Superset →</a>`
+        : "";
+      html += `<div class="footer">
+        <span>Checked: ${{checked}}</span>
+        ${{linkHtml}}
+      </div>`;
 
       el.innerHTML = html;
       el.style.display = "block";
