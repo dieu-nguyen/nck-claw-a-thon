@@ -437,7 +437,6 @@ async def dashboard_ui():
     }}
 
     // Per-task box tracking
-    let currentTaskId = null;
     const taskBoxes = {{}};  // check_id → {{ stepsEl, resultEl, headerBadge, boxEl }}
 
     function openTaskBox(taskName, checkId) {{
@@ -489,12 +488,11 @@ async def dashboard_ui():
       boxes.appendChild(box);
 
       taskBoxes[checkId] = {{ stepsEl, stepsToggle, statusBar, metaBar, resultEl, headerBadge: badge, headerEl: header, boxEl: box, taskName }};
-      currentTaskId = checkId;
     }}
 
-    function addStep(msg) {{
-      if (!currentTaskId || !taskBoxes[currentTaskId]) return;
-      const {{ stepsEl }} = taskBoxes[currentTaskId];
+    function addStep(checkId, msg) {{
+      if (!taskBoxes[checkId]) return;
+      const {{ stepsEl }} = taskBoxes[checkId];
       const line = document.createElement("div");
       line.textContent = msg;
       stepsEl.appendChild(line);
@@ -565,7 +563,6 @@ async def dashboard_ui():
     function runMonitor() {{
       if (running) return;
       running = true;
-      currentTaskId = null;
       Object.keys(taskBoxes).forEach(k => delete taskBoxes[k]);
 
       document.getElementById("run-btn").disabled = true;
@@ -629,8 +626,8 @@ async def dashboard_ui():
           document.getElementById("hint").textContent = "";
           document.getElementById("run-btn").disabled = false;
           document.getElementById("run-btn").textContent = "▶ Chạy lại";
-        }} else {{
-          addStep(e.data);
+        }} else if (data.__step__ !== undefined) {{
+          addStep(data.check_id, data.__step__);
         }}
       }};
 

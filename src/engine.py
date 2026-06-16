@@ -126,10 +126,21 @@ async def _run_prompt(
 
     async def emit(msg: str) -> None:
         if on_step:
-            await on_step(msg)
+            # Wrap plain text steps with check_id so parallel tasks route correctly
+            try:
+                parsed_msg = json.loads(msg)
+                if not any(k.startswith("__") for k in parsed_msg):
+                    raise ValueError("not a control event")
+                await on_step(msg)
+            except (json.JSONDecodeError, ValueError):
+                await on_step(json.dumps({"__step__": msg, "check_id": check_id}, ensure_ascii=False))
+
+    async def emit_control(payload: dict) -> None:
+        if on_step:
+            await on_step(json.dumps(payload, ensure_ascii=False))
 
     # Signal to the UI that a new task box should open
-    await emit(json.dumps({"__task_start__": check_name, "check_id": check_id}, ensure_ascii=False))
+    await emit_control({"__task_start__": check_name, "check_id": check_id})
 
     try:
         llm_client = AsyncOpenAI(
@@ -198,18 +209,16 @@ async def _run_prompt(
                          is_abnormal=cr.is_abnormal, status=cr.status,
                          summary=cr.summary, analysis=cr.analysis,
                          recommendations=cr.recommendations)
-                await emit(json.dumps({
-                    "__task_result__": {
-                        "check_id": cr.check_id,
-                        "check_name": cr.check_name,
-                        "is_abnormal": cr.is_abnormal,
-                        "status": cr.status,
-                        "summary": cr.summary,
-                        "analysis": cr.analysis,
-                        "recommendations": cr.recommendations,
-                        "error": cr.error,
-                    }
-                }, ensure_ascii=False))
+                await emit_control({"__task_result__": {
+                    "check_id": cr.check_id,
+                    "check_name": cr.check_name,
+                    "is_abnormal": cr.is_abnormal,
+                    "status": cr.status,
+                    "summary": cr.summary,
+                    "analysis": cr.analysis,
+                    "recommendations": cr.recommendations,
+                    "error": cr.error,
+                }})
                 return cr
 
             messages.append({"role": "assistant", "content": raw})
@@ -286,10 +295,7 @@ async def _run_prompt(
                         dashboard_id = dashboards[0].get("id")
                         await emit(f"🔍 Đã tìm thấy dashboard: \"{dashboards[0]['name']}\"")
                         if dashboard_id:
-                            await emit(json.dumps({
-                                "__dashboard_id__": dashboard_id,
-                                "check_id": check_id,
-                            }, ensure_ascii=False))
+                            await emit_control({"__dashboard_id__": dashboard_id, "check_id": check_id})
                     tool_content = f"Dashboards matching '{name}': {json.dumps(dashboards, default=str)[:2000]}"
                     messages.append({"role": "user", "content": tool_content})
                     log_step(steps, action="search_dashboards", llm_raw=raw,
@@ -365,18 +371,16 @@ async def _run_prompt(
         cr.analysis = parsed.get("analysis", "")
         cr.recommendations = parsed.get("recommendations", [])
         cr.extra_charts_fetched = extra_charts
-        await emit(json.dumps({
-            "__task_result__": {
-                "check_id": cr.check_id,
-                "check_name": cr.check_name,
-                "is_abnormal": cr.is_abnormal,
-                "status": cr.status,
-                "summary": cr.summary,
-                "analysis": cr.analysis,
-                "recommendations": cr.recommendations,
-                "error": cr.error,
-            }
-        }, ensure_ascii=False))
+        await emit_control({"__task_result__": {
+            "check_id": cr.check_id,
+            "check_name": cr.check_name,
+            "is_abnormal": cr.is_abnormal,
+            "status": cr.status,
+            "summary": cr.summary,
+            "analysis": cr.analysis,
+            "recommendations": cr.recommendations,
+            "error": cr.error,
+        }})
         return cr
 
     except SupersetError as e:
@@ -384,18 +388,16 @@ async def _run_prompt(
     except Exception as e:
         cr.error = f"Unexpected error: {e}"
 
-    await emit(json.dumps({
-        "__task_result__": {
-            "check_id": cr.check_id,
-            "check_name": cr.check_name,
-            "is_abnormal": False,
-            "status": "error",
-            "summary": cr.error or "Unknown error",
-            "analysis": "",
-            "recommendations": [],
-            "error": cr.error,
-        }
-    }, ensure_ascii=False))
+    await emit_control({"__task_result__": {
+        "check_id": cr.check_id,
+        "check_name": cr.check_name,
+        "is_abnormal": False,
+        "status": "error",
+        "summary": cr.error or "Unknown error",
+        "analysis": "",
+        "recommendations": [],
+        "error": cr.error,
+    }})
     return cr
 
 
