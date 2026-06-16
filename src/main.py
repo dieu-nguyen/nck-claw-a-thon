@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Security
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Security
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.engine import run_engine
@@ -116,7 +116,7 @@ async def _run(dry_run: bool = False) -> dict:
     with RunLog(log_dir=log_dir, run_ts=run_ts) as log:
         log.write("run_start", prompts_dir=prompts_dir, dry_run=dry_run)
 
-        results = await run_engine(prompts_dir, superset)
+        results = await run_engine(prompts_dir, superset, log=log)
 
         for cr in results:
             log.write(
@@ -160,6 +160,65 @@ async def run_endpoint(credentials: HTTPAuthorizationCredentials = Security(_bea
         raise HTTPException(status_code=500, detail=str(e)) from e
     except SupersetError as e:
         raise HTTPException(status_code=502, detail=f"Superset unreachable: {e}") from e
+
+
+@app.get("/run/stream")
+async def run_stream(token: str = Query(...)):
+    expected = os.getenv("API_TOKEN", "")
+    if not expected or token != expected:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    async def event_stream():
+        import asyncio
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        async def on_step(msg: str) -> None:
+            await queue.put(msg)
+
+        async def run_task():
+            try:
+                prompts_dir = os.getenv("PROMPTS_DIR", "./prompts")
+                log_dir = os.getenv("RUN_LOG_DIR", "./logs")
+                run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                superset = SupersetClient(
+                    base_url=_get_env("SUPERSET_BASE_URL"),
+                    username=_get_env("SUPERSET_USERNAME"),
+                    password=_get_env("SUPERSET_PASSWORD"),
+                )
+                with RunLog(log_dir=log_dir, run_ts=run_ts) as log:
+                    log.write("run_start", prompts_dir=prompts_dir, dry_run=False)
+                    results = await run_engine(prompts_dir, superset, on_step=on_step, log=log)
+                    for cr in results:
+                        log.write("check_complete", check_id=cr.check_id,
+                                  is_abnormal=cr.is_abnormal, status=cr.status, error=cr.error)
+                    report = build_report(results=results, run_ts=run_ts)
+                    log.write("run_complete", status=report["status"],
+                              anomaly_count=report["anomaly_count"])
+                teams_webhook_url = os.getenv("TEAMS_WEBHOOK_URL", "")
+                if teams_webhook_url:
+                    try:
+                        message_text = _format_teams_message(report)
+                        await _post_to_teams(teams_webhook_url, message_text)
+                    except Exception as e:
+                        report["teams_post_error"] = str(e)
+                await queue.put(json.dumps({"__report__": report}, ensure_ascii=False))
+            except Exception as e:
+                await queue.put(json.dumps({"__error__": str(e)}, ensure_ascii=False))
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(run_task())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield f"data: {item}\n\n"
+        finally:
+            task.cancel()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/health")
@@ -238,89 +297,117 @@ async def dashboard_ui():
       animation: spin 0.8s linear infinite;
     }}
     @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-    #report {{ display: none; margin-top: 40px; width: 100%; max-width: 800px; }}
-    .report-header {{
-      padding: 20px 24px;
-      border-radius: 10px 10px 0 0;
-      font-size: 1.125rem;
-      font-weight: 700;
+    #task-boxes {{
+      margin-top: 24px;
+      width: 100%;
+      max-width: 800px;
+      display: none;
+      flex-direction: column;
+      gap: 16px;
     }}
-    .all-clear {{ background: #f0fdf4; border: 1px solid #86efac; color: #15803d; }}
-    .has-alerts {{ background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; }}
-    .meta {{
-      padding: 12px 24px;
-      background: #f8fafc;
-      font-size: 0.8rem;
-      color: #94a3b8;
-      border-left: 1px solid #e2e8f0;
-      border-right: 1px solid #e2e8f0;
+    .task-box {{
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      overflow: hidden;
+    }}
+    /* colour-coded left border per status */
+    .task-box.status-ok    {{ border-left: 4px solid #22c55e; }}
+    .task-box.status-warning {{ border-left: 4px solid #f59e0b; }}
+    .task-box.status-critical {{ border-left: 4px solid #ef4444; }}
+    .task-box.status-error  {{ border-left: 4px solid #f97316; }}
+    /* ── header row ── */
+    .task-box-header {{
       display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: #0f172a;
+    }}
+    .task-status-badge {{
+      font-size: 0.75rem;
+      font-weight: 500;
+      padding: 2px 10px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      color: #64748b;
+      white-space: nowrap;
+    }}
+    .task-status-badge.running  {{ background: #dbeafe; color: #1d4ed8; }}
+    .task-status-badge.ok       {{ background: #dcfce7; color: #15803d; }}
+    .task-status-badge.warning  {{ background: #fef9c3; color: #92400e; }}
+    .task-status-badge.critical {{ background: #fee2e2; color: #991b1b; }}
+    /* ── status banner (shown after done) ── */
+    .task-status-bar {{
+      display: none;
+      padding: 10px 18px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      border-bottom: 1px solid #e2e8f0;
+    }}
+    .task-status-bar.ok       {{ background: #f0fdf4; color: #15803d; }}
+    .task-status-bar.warning  {{ background: #fffbeb; color: #92400e; }}
+    .task-status-bar.critical {{ background: #fef2f2; color: #991b1b; }}
+    /* ── meta bar (time, elapsed, link) ── */
+    .task-meta {{
+      display: none;
+      padding: 7px 18px;
+      font-size: 0.78rem;
+      color: #94a3b8;
+      background: #f8fafc;
+      border-bottom: 1px solid #f1f5f9;
       gap: 16px;
       flex-wrap: wrap;
-    }}
-    .anomaly {{
-      margin-top: 1px;
-      padding: 20px 24px;
-      background: #fff;
-      border-left: 4px solid #ef4444;
-      border-right: 1px solid #e2e8f0;
-    }}
-    .anomaly.warning {{ border-left-color: #f59e0b; }}
-    .anomaly-name {{ font-weight: 700; font-size: 1rem; margin-bottom: 8px; color: #0f172a; }}
-    .anomaly-summary {{ font-size: 0.9rem; color: #334155; margin-bottom: 10px; }}
-    .anomaly-analysis {{ font-size: 0.85rem; color: #475569; margin-bottom: 12px; white-space: pre-wrap; }}
-    .recs {{ list-style: none; }}
-    .recs li {{ font-size: 0.85rem; color: #475569; padding: 3px 0; }}
-    .recs li::before {{ content: "→ "; color: #3b82f6; }}
-    .error-block {{
-      margin-top: 1px;
-      padding: 16px 24px;
-      background: #fff7ed;
-      border-left: 4px solid #f97316;
-      border-right: 1px solid #e2e8f0;
-      font-size: 0.85rem;
-      color: #9a3412;
-    }}
-    .footer {{
-      padding: 14px 24px;
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-top: none;
-      border-radius: 0 0 10px 10px;
-      font-size: 0.8rem;
-      color: #94a3b8;
-      display: flex;
-      justify-content: space-between;
       align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
     }}
-    .footer a {{
-      color: #3b82f6;
-      text-decoration: none;
-      font-size: 0.8rem;
-    }}
-    .footer a:hover {{ text-decoration: underline; }}
-    .normal-block {{
-      margin-top: 1px;
-      padding: 16px 24px;
-      background: #fff;
-      border-left: 1px solid #e2e8f0;
-      border-right: 1px solid #e2e8f0;
+    .task-meta a {{ color: #3b82f6; text-decoration: none; }}
+    .task-meta a:hover {{ text-decoration: underline; }}
+    /* ── result body ── */
+    .task-box-result {{
+      display: none;
+      padding: 14px 18px;
       font-size: 0.875rem;
-      color: #475569;
+      border-bottom: 1px solid #f1f5f9;
     }}
+    .task-result-summary {{ color: #334155; margin-bottom: 8px; }}
+    .task-result-analysis {{ font-size: 0.83rem; color: #475569; white-space: pre-wrap; margin-bottom: 10px; }}
+    .task-result-recs {{ list-style: none; margin-top: 4px; }}
+    .task-result-recs li {{ font-size: 0.83rem; color: #475569; padding: 2px 0; }}
+    .task-result-recs li::before {{ content: "→ "; color: #3b82f6; }}
+    /* ── step toggle & steps ── */
+    .task-box-steps-toggle {{
+      display: none;
+      padding: 7px 18px;
+      font-size: 0.75rem;
+      color: #94a3b8;
+      cursor: pointer;
+      user-select: none;
+      border-bottom: 1px solid #f1f5f9;
+    }}
+    .task-box-steps-toggle:hover {{ color: #64748b; }}
+    .task-box-steps {{
+      padding: 10px 18px 14px;
+      font-size: 0.83rem;
+      color: #475569;
+      line-height: 1.9;
+      background: #fafafa;
+    }}
+    .task-box-steps.collapsed {{ display: none; }}
   </style>
 </head>
 <body>
   <h1>🔍 Dashboard Monitor</h1>
   <p class="subtitle">Bank Link SR — Monitoring Assistant</p>
-  <button id="run-btn" onclick="runMonitor()">▶ Run Now</button>
+  <button id="run-btn" onclick="runMonitor()">▶ Chạy</button>
   <div id="status"></div>
   <div id="hint"></div>
   <div id="timer"></div>
   <div id="spinner"></div>
-  <div id="report"></div>
+  <div id="task-boxes"></div>
 
   <script>
     const API_TOKEN = "{token}";
@@ -336,7 +423,7 @@ async def dashboard_ui():
         const m = Math.floor(elapsed / 60);
         const s = elapsed % 60;
         document.getElementById("timer").textContent =
-          `⏱ ${{m > 0 ? m + "m " : ""}}${{s}}s elapsed`;
+          `⏱ ${{m > 0 ? m + "m " : ""}}${{s}}s`;
       }}, 1000);
     }}
 
@@ -345,119 +432,222 @@ async def dashboard_ui():
       timerInterval = null;
     }}
 
-    async function runMonitor() {{
+    // Per-task box tracking
+    let currentTaskId = null;
+    const taskBoxes = {{}};  // check_id → {{ stepsEl, resultEl, headerBadge, boxEl }}
+
+    function openTaskBox(taskName, checkId) {{
+      const boxes = document.getElementById("task-boxes");
+      boxes.style.display = "flex";
+
+      const box = document.createElement("div");
+      box.className = "task-box";
+      box.id = "task-" + checkId;
+
+      // 1. Header row: task name + running badge
+      const badge = document.createElement("span");
+      badge.className = "task-status-badge running";
+      badge.textContent = "Đang chạy…";
+      const header = document.createElement("div");
+      header.className = "task-box-header";
+      header.innerHTML = `<span>🔄 ${{taskName}}</span>`;
+      header.appendChild(badge);
+
+      // 2. Status banner (hidden until done)
+      const statusBar = document.createElement("div");
+      statusBar.className = "task-status-bar";
+
+      // 3. Meta bar: time + elapsed + dashboard link (hidden until done)
+      const metaBar = document.createElement("div");
+      metaBar.className = "task-meta";
+
+      // 4. Result body: summary / analysis / recs (hidden until done)
+      const resultEl = document.createElement("div");
+      resultEl.className = "task-box-result";
+
+      // 5. Step toggle (hidden until done)
+      const stepsEl = document.createElement("div");
+      stepsEl.className = "task-box-steps";
+      const stepsToggle = document.createElement("div");
+      stepsToggle.className = "task-box-steps-toggle";
+      stepsToggle.textContent = "▶ Xem các bước thực hiện";
+      stepsToggle.addEventListener("click", () => {{
+        const collapsed = stepsEl.classList.toggle("collapsed");
+        stepsToggle.textContent = collapsed ? "▶ Xem các bước thực hiện" : "▼ Ẩn các bước thực hiện";
+      }});
+
+      box.appendChild(header);
+      box.appendChild(statusBar);
+      box.appendChild(metaBar);
+      box.appendChild(resultEl);
+      box.appendChild(stepsToggle);
+      box.appendChild(stepsEl);
+      boxes.appendChild(box);
+
+      taskBoxes[checkId] = {{ stepsEl, stepsToggle, statusBar, metaBar, resultEl, headerBadge: badge, headerEl: header, boxEl: box, taskName }};
+      currentTaskId = checkId;
+    }}
+
+    function addStep(msg) {{
+      if (!currentTaskId || !taskBoxes[currentTaskId]) return;
+      const {{ stepsEl }} = taskBoxes[currentTaskId];
+      const line = document.createElement("div");
+      line.textContent = msg;
+      stepsEl.appendChild(line);
+    }}
+
+    function finalizeTaskBox(checkId, resultData, runTs, elapsedStr) {{
+      if (!taskBoxes[checkId]) return;
+      const {{ stepsEl, stepsToggle, statusBar, metaBar, resultEl, headerBadge, headerEl, boxEl, taskName }} = taskBoxes[checkId];
+
+      const status = resultData.status || "normal";
+      const isAbnormal = resultData.is_abnormal;
+      const summary = resultData.summary || "";
+      const analysis = resultData.analysis || "";
+      const recs = resultData.recommendations || [];
+
+      let statusLabel, statusCls, icon, boxCls, bannerText;
+      if (!isAbnormal) {{
+        statusLabel = "Bình thường"; statusCls = "ok"; icon = "✅"; boxCls = "status-ok";
+        bannerText = "✅ Tất cả chỉ số bình thường";
+      }} else if (status === "critical") {{
+        statusLabel = "Cần chú ý"; statusCls = "critical"; icon = "🔴"; boxCls = "status-critical";
+        bannerText = "🔴 Phát hiện bất thường — cần chú ý";
+      }} else {{
+        statusLabel = "Cần theo dõi"; statusCls = "warning"; icon = "⚠️"; boxCls = "status-warning";
+        bannerText = "⚠️ Phát hiện bất thường — cần theo dõi";
+      }}
+
+      // Header: update icon + badge
+      headerBadge.textContent = statusLabel;
+      headerBadge.className = `task-status-badge ${{statusCls}}`;
+      headerEl.querySelector("span").textContent = `${{icon}} ${{taskName}}`;
+      boxEl.className = `task-box ${{boxCls}}`;
+
+      // Status banner
+      statusBar.textContent = bannerText;
+      statusBar.className = `task-status-bar ${{statusCls}}`;
+      statusBar.style.display = "block";
+
+      // Meta bar
+      const linkHtml = DASHBOARD_LINK
+        ? `<a href="${{DASHBOARD_LINK}}" target="_blank">📊 Mở dashboard →</a>`
+        : "";
+      metaBar.innerHTML = `<span>🕐 ${{runTs}} UTC</span><span>⏱ ${{elapsedStr}}</span>${{linkHtml}}`;
+      metaBar.style.display = "flex";
+
+      // Result body
+      let html = "";
+      if (summary) html += `<div class="task-result-summary">${{summary}}</div>`;
+      if (analysis) html += `<div class="task-result-analysis">${{analysis}}</div>`;
+      if (recs.length) {{
+        html += `<ul class="task-result-recs">`;
+        for (const r of recs) html += `<li>${{r}}</li>`;
+        html += `</ul>`;
+      }}
+      if (html) {{ resultEl.innerHTML = html; resultEl.style.display = "block"; }}
+
+      // Steps: collapse by default, show toggle
+      stepsEl.classList.add("collapsed");
+      stepsToggle.style.display = "block";
+      stepsToggle.textContent = "▶ Xem các bước thực hiện";
+    }}
+
+    function runMonitor() {{
       if (running) return;
       running = true;
+      currentTaskId = null;
+      Object.keys(taskBoxes).forEach(k => delete taskBoxes[k]);
 
       document.getElementById("run-btn").disabled = true;
-      document.getElementById("run-btn").textContent = "Analysing…";
-      document.getElementById("report").style.display = "none";
-      document.getElementById("report").innerHTML = "";
+      document.getElementById("run-btn").textContent = "Đang phân tích…";
+      document.getElementById("task-boxes").style.display = "none";
+      document.getElementById("task-boxes").innerHTML = "";
       document.getElementById("spinner").style.display = "block";
       document.getElementById("status").textContent = "🤖 Agent đang đọc dashboard và phân tích dữ liệu…";
       document.getElementById("hint").textContent = "Thường mất khoảng 2–3 phút, vui lòng chờ.";
       document.getElementById("timer").textContent = "";
       startTimer();
 
-      let elapsed = 0;
-      try {{
-        const res = await fetch("/run", {{
-          method: "POST",
-          headers: {{ "Authorization": "Bearer " + API_TOKEN }}
-        }});
-        elapsed = Math.round((Date.now() - startTime) / 1000);
-        if (!res.ok) {{
-          const err = await res.json().catch(() => ({{}}));
-          throw new Error(err.detail || res.statusText);
+      const es = new EventSource(`/run/stream?token=${{encodeURIComponent(API_TOKEN)}}`);
+
+      es.onmessage = (e) => {{
+        let data;
+        try {{ data = JSON.parse(e.data); }} catch {{ addStep(e.data); return; }}
+
+        if (data.__task_start__) {{
+          openTaskBox(data.__task_start__, data.check_id);
+          return;
         }}
-        const data = await res.json();
-        renderReport(data, elapsed);
-        document.getElementById("status").textContent = "";
-        document.getElementById("hint").textContent = "";
-        document.getElementById("timer").textContent = "";
-      }} catch (e) {{
-        document.getElementById("status").textContent = "❌ Lỗi: " + e.message;
-        document.getElementById("hint").textContent = "";
-      }} finally {{
-        running = false;
+
+        if (data.__report__) {{
+          const r = data.__report__;
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          const elapsedStr = elapsed >= 60
+            ? `Hoàn thành trong ${{Math.floor(elapsed/60)}}m ${{elapsed%60}}s`
+            : `Hoàn thành trong ${{elapsed}}s`;
+          const runTs = r.run_ts || "";
+
+          // Finalize each task box
+          const allChecks = [
+            ...(r.anomalies || []),
+            ...(r.normal || []).map(n => ({{ ...n, is_abnormal: false, status: "normal", analysis: "", recommendations: [] }})),
+          ];
+          for (const check of allChecks) {{
+            if (check.check_id && taskBoxes[check.check_id]) {{
+              finalizeTaskBox(check.check_id, check, runTs, elapsedStr);
+            }}
+          }}
+          // Fallback for any box without a result entry (e.g. engine error)
+          for (const [id, box] of Object.entries(taskBoxes)) {{
+            if (box.headerBadge && box.headerBadge.className.includes("running")) {{
+              finalizeTaskBox(id, {{ is_abnormal: false, status: "normal", summary: "", analysis: "", recommendations: [] }}, runTs, elapsedStr);
+            }}
+          }}
+
+          es.close();
+          stopTimer();
+          running = false;
+          document.getElementById("spinner").style.display = "none";
+          document.getElementById("status").textContent = "";
+          document.getElementById("hint").textContent = "";
+          document.getElementById("timer").textContent = "";
+          document.getElementById("run-btn").disabled = false;
+          document.getElementById("run-btn").textContent = "▶ Chạy lại";
+          renderErrors(r.errors);
+        }} else if (data.__error__) {{
+          es.close();
+          stopTimer();
+          running = false;
+          document.getElementById("spinner").style.display = "none";
+          document.getElementById("status").textContent = "❌ Lỗi: " + data.__error__;
+          document.getElementById("hint").textContent = "";
+          document.getElementById("run-btn").disabled = false;
+          document.getElementById("run-btn").textContent = "▶ Chạy lại";
+        }} else {{
+          addStep(e.data);
+        }}
+      }};
+
+      es.onerror = () => {{
+        es.close();
         stopTimer();
+        running = false;
         document.getElementById("spinner").style.display = "none";
+        document.getElementById("status").textContent = "❌ Mất kết nối với server.";
+        document.getElementById("hint").textContent = "";
         document.getElementById("run-btn").disabled = false;
         document.getElementById("run-btn").textContent = "▶ Chạy lại";
-      }}
+      }};
     }}
 
-    function renderReport(r, elapsed) {{
-      const el = document.getElementById("report");
-      const ts = r.run_ts || "";
-      const anomalyCount = r.anomaly_count || 0;
-      const total = r.total_checked || 0;
-      const checked = (r.checked_names || []).join(", ");
-      const hasErrors = (r.errors || []).length > 0;
-      const isOk = anomalyCount === 0 && !hasErrors;
-      const elapsedStr = elapsed >= 60
-        ? `${{Math.floor(elapsed/60)}}m ${{elapsed%60}}s`
-        : `${{elapsed}}s`;
-
-      let html = "";
-
-      // Header — friendly wording
-      if (isOk) {{
-        html += `<div class="report-header all-clear">✅ Tất cả bình thường</div>`;
-      }} else if (anomalyCount > 0) {{
-        const worst = (r.anomalies || []).some(a => a.status === "critical") ? "🔴 Cần chú ý" : "⚠️ Cần theo dõi";
-        html += `<div class="report-header has-alerts">${{worst}} — ${{anomalyCount}} luồng phát hiện bất thường</div>`;
-      }} else {{
-        html += `<div class="report-header has-alerts">⚠️ Có lỗi xử lý trong quá trình chạy</div>`;
-      }}
-
-      // Meta bar
-      html += `<div class="meta">
-        <span>🕐 ${{ts}} UTC</span>
-        <span>⏱ Hoàn thành trong ${{elapsedStr}}</span>
-        <span>📋 Đã kiểm tra ${{total}} luồng</span>
-      </div>`;
-
-      // Anomalies
-      for (const a of (r.anomalies || [])) {{
-        const isCrit = a.status === "critical";
-        const icon = isCrit ? "🔴" : "⚠️";
-        const cls = isCrit ? "" : "warning";
-        html += `<div class="anomaly ${{cls}}">`;
-        html += `<div class="anomaly-name">${{icon}} ${{a.name}}</div>`;
-        if (a.summary) html += `<div class="anomaly-summary">${{a.summary}}</div>`;
-        if (a.analysis) html += `<div class="anomaly-analysis">${{a.analysis}}</div>`;
-        if (a.recommendations && a.recommendations.length) {{
-          html += `<ul class="recs">`;
-          for (const rec of a.recommendations) html += `<li>${{rec}}</li>`;
-          html += `</ul>`;
-        }}
-        html += `</div>`;
-      }}
-
-      // Normal flows
-      if (isOk) {{
-        for (const name of (r.checked_names || [])) {{
-          html += `<div class="normal-block">✅ ${{name}} — bình thường</div>`;
-        }}
-      }}
-
-      // Engine errors
-      for (const e of (r.errors || [])) {{
-        html += `<div class="error-block">⚠️ Lỗi xử lý: ${{e.name}} — ${{e.message}}</div>`;
-      }}
-
-      // Footer with dashboard link
-      const linkHtml = DASHBOARD_LINK
-        ? `<a href="${{DASHBOARD_LINK}}" target="_blank">📊 Mở dashboard Superset →</a>`
-        : "";
-      html += `<div class="footer">
-        <span>Checked: ${{checked}}</span>
-        ${{linkHtml}}
-      </div>`;
-
-      el.innerHTML = html;
-      el.style.display = "block";
+    function renderErrors(errors) {{
+      if (!errors || !errors.length) return;
+      const boxes = document.getElementById("task-boxes");
+      const div = document.createElement("div");
+      div.style.cssText = "background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px 18px;font-size:0.85rem;color:#9a3412;";
+      div.innerHTML = errors.map(e => `⚠️ Lỗi xử lý: ${{e.name}} — ${{e.message}}`).join("<br>");
+      boxes.appendChild(div);
     }}
   </script>
 </body>
