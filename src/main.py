@@ -589,7 +589,7 @@ async def dashboard_ui():
         if (data.__dashboard_id__ !== undefined) {{
           const checkId = data.check_id;
           if (SUPERSET_BASE && checkId) {{
-            taskDashboardLinks[checkId] = `${{SUPERSET_BASE}}/superset/dashboard/${{data.__dashboard_id__}}/`;
+            taskDashboardLinks[checkId] = `${{SUPERSET_BASE}}/superset/dashboard/${{data.__dashboard_id__}}/?standalone=1`;
           }}
           return;
         }}
