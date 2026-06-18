@@ -16,6 +16,7 @@ class SupersetClient:
         self._password = password
         self._retries = retries
         self._token: str | None = None
+        self._csrf: str = ""
 
     async def _login(self, client: httpx.AsyncClient) -> None:
         resp = await client.post(
@@ -29,9 +30,20 @@ class SupersetClient:
         )
         resp.raise_for_status()
         self._token = resp.json()["access_token"]
+        # Fetch CSRF token — required for POST endpoints like /api/v1/chart/data
+        csrf_resp = await client.get(
+            f"{self._base}/api/v1/security/csrf_token/",
+            headers={"Authorization": f"Bearer {self._token}"},
+        )
+        csrf_resp.raise_for_status()
+        self._csrf = csrf_resp.json().get("result", "")
 
     def _auth_headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._token}"}
+        headers = {"Authorization": f"Bearer {self._token}"}
+        if self._csrf:
+            headers["X-CSRFToken"] = self._csrf
+            headers["Referer"] = self._base
+        return headers
 
     async def _request_with_retry(
         self, client: httpx.AsyncClient, method: str, url: str, **kwargs
@@ -62,39 +74,52 @@ class SupersetClient:
             await self._login(client)
             return await self._request_with_retry(client, method, url, **kwargs)
 
-    def _chart_data_body(self, chart: dict) -> dict:
-        query_context = chart.get("query_context")
-        if isinstance(query_context, str):
-            query_context = json.loads(query_context)
-        if not query_context:
-            raise SupersetError(f"Chart {chart.get('id')} has no query_context")
-
-        form_data = query_context.get("form_data")
-        if isinstance(form_data, str):
-            form_data = json.loads(form_data)
-        if not form_data:
-            params = chart.get("params")
-            form_data = json.loads(params) if isinstance(params, str) else params
-
-        return {
-            "datasource": query_context["datasource"],
-            "queries": query_context["queries"],
-            "form_data": form_data,
-            "result_format": "json",
-            "result_type": "full",
-        }
+    async def _get_session_headers(self, client: httpx.AsyncClient) -> dict:
+        """Login with web session + JWT to get headers accepted by POST endpoints."""
+        import re as _re
+        await client.get(f"{self._base}/login/")
+        login_page = await client.get(f"{self._base}/login/")
+        m = _re.search(r'name="csrf_token"[^>]*value="([^"]+)"', login_page.text)
+        web_csrf = m.group(1) if m else ""
+        await client.post(f"{self._base}/login/", data={
+            "username": self._username, "password": self._password, "csrf_token": web_csrf,
+        })
+        resp = await client.post(f"{self._base}/api/v1/security/login", json={
+            "username": self._username, "password": self._password,
+            "provider": "db", "refresh": True,
+        })
+        resp.raise_for_status()
+        token = resp.json()["access_token"]
+        csrf_r = await client.get(f"{self._base}/api/v1/security/csrf_token/",
+                                  headers={"Authorization": f"Bearer {token}"})
+        csrf_r.raise_for_status()
+        csrf = csrf_r.json().get("result", "")
+        return {"Authorization": f"Bearer {token}", "X-CSRFToken": csrf, "Referer": self._base}
 
     async def get_chart_data(self, chart_id: int) -> dict:
-        async with httpx.AsyncClient(timeout=30) as client:
-            await self._login(client)
-            chart_resp = await self._request_with_retry(
-                client, "GET", f"{self._base}/api/v1/chart/{chart_id}"
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            headers = await self._get_session_headers(client)
+
+            # Get the stored query_context from the chart API — it has the correct
+            # datasource, columns, metrics, and filters already configured.
+            chart_r = await client.get(
+                f"{self._base}/api/v1/chart/{chart_id}", headers=headers)
+            chart_r.raise_for_status()
+            qc_str = chart_r.json().get("result", {}).get("query_context", "")
+            if not qc_str:
+                raise SupersetError(
+                    f"Chart {chart_id}: no query_context available — open the chart in "
+                    "Superset and save it once to generate query_context"
+                )
+            query_context = json.loads(qc_str)
+
+            resp = await client.post(
+                f"{self._base}/api/v1/chart/data",
+                headers={**headers, "Content-Type": "application/json"},
+                json=query_context,
             )
-            chart = chart_resp.get("result", chart_resp)
-            body = self._chart_data_body(chart)
-            return await self._request_with_retry(
-                client, "POST", f"{self._base}/api/v1/chart/data", json=body
-            )
+            resp.raise_for_status()
+            return resp.json()
 
     async def list_charts(self, dashboard_id: int) -> list[dict]:
         result = await self._request_with_retry_new_session(
